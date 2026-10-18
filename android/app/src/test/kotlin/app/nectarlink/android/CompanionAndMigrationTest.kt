@@ -2,6 +2,7 @@
 package app.nectarlink.android
 
 import app.nectarlink.android.companion.PcCompanion
+import app.nectarlink.android.service.ConnectionService
 import app.nectarlink.android.ui.Preferences
 import app.nectarlink.android.ui.theme.Appearance
 import app.nectarlink.android.ui.theme.Tokens
@@ -81,5 +82,11 @@ class CompanionAndMigrationTest {
         assertEquals("dark", valid.mode)
         assertEquals("ocean", valid.seed)
         assertFalse(valid.dynamicColor)
+    }
+
+    @Test
+    fun `ConnectionService stop action and Preferences background service key`() {
+        assertEquals("app.nectarlink.action.STOP_SERVICE", ConnectionService.ACTION_STOP_SERVICE)
+        assertEquals("background_service_enabled", Preferences.BACKGROUND_SERVICE_ENABLED)
     }
 }
