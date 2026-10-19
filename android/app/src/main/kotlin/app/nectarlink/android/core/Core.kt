@@ -369,7 +369,8 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
         if (startJob != null) return
         val currentRun = Job()
         runJob = currentRun
-        val runScope = CoroutineScope(scope.coroutineContext + currentRun)
+        val currentRunScope = CoroutineScope(scope.coroutineContext + currentRun)
+        runScope = currentRunScope
         startJob = scope.launch(Dispatchers.IO) {
             initLogging(if (BuildConfig.DEBUG) "debug,iroh=info,swarm_discovery=error" else "info,iroh=warn,swarm_discovery=error")
             val initialAwayMode = app.nectarlink.android.ui.Preferences.isAwayModeEnabled(context)
@@ -493,6 +494,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                 battery.start()
                 accent.start()
                 network.start()
+                if (NotificationListener.hasAccess(context)) phoneMedia.start()
                 if (PhoneCalls.canFollow(context) || PhoneCalls.canReadLog(context)) calls.start()
                 if (PhoneContacts.canRead(context)) contacts.start()
                 if (PhoneSms.canRead(context)) sms.start()
@@ -583,7 +585,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
     fun notificationAccessChanged(granted: Boolean, showing: List<Notification>) {
         _state.update { it.copy(notificationAccess = granted) }
         if (granted && _state.value.devices.isNotEmpty()) ConnectionService.start(context)
-        scope.launch(Dispatchers.Main) { if (granted) phoneMedia.start() else phoneMedia.stop() }
+        runScope?.launch(Dispatchers.Main) { if (granted) phoneMedia.start() else phoneMedia.stop() }
         enqueueNotificationOp { node ->
             node.updatePower(powerLevel(), capabilities(granted))
             node.notificationsReset(showing)
@@ -680,8 +682,10 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                     } else if (becameSensitive) {
                         NotificationListener.instance?.refreshActive()
                     }
-                    if (node != null) {
-                        scope.launch(Dispatchers.Main) {
+                    val currentScope = runScope
+                    if (node != null && currentScope != null) {
+                        currentScope.launch(Dispatchers.Main) {
+                            if (granted) phoneMedia.start() else phoneMedia.stop()
                             if (_state.value.devices.any { it.online }) toggles.start() else toggles.stop()
                             if (photoAccess) photos.start() else photos.stop()
                             if (PhoneCalls.canFollow(context) || PhoneCalls.canReadLog(context)) calls.start() else calls.stop()
