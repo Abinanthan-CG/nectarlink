@@ -62,8 +62,11 @@ import app.nectarlink.android.files.transferTitle
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -90,7 +93,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
     /** What plays on this phone, for PCs (needs notification access). */
     private val phoneMedia = PhoneMedia(this.context) { players ->
         syncActiveMediaColor()
-        notificationOps.trySend { it.mediaChanged(players) }
+        enqueueNotificationOp { it.mediaChanged(players) }
     }
     private val platform = PhonePlatform(
         this.context,
@@ -146,43 +149,43 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
         onKeyboardFromPc = { pc, on -> setKeyboardFromPc(pc, on) },
     )
     private val storage = PhoneStorage(this.context) { path ->
-        notificationOps.trySend { it.storageChanged(path) }
+        enqueueNotificationOp { it.storageChanged(path) }
     }
     private val toggles = PhoneToggles(
         this.context,
         onChanged = { state ->
-            notificationOps.trySend { node ->
+            enqueueNotificationOp { node ->
                 runCatching { node.togglesChanged(state) }.onFailure { Log.i(TAG, "toggles weren't reported", it) }
             }
         },
         onCapabilitiesChanged = { refreshNotificationAccess() },
     )
     private val sms = PhoneSms(this.context) {
-        notificationOps.trySend { it.smsChanged(null) }
+        enqueueNotificationOp { it.smsChanged(null) }
     }
     private val calls = PhoneCalls(
         this.context,
         onChange = { call ->
-            notificationOps.trySend { node ->
+            enqueueNotificationOp { node ->
                 runCatching { node.callChanged(call) }.onFailure { Log.i(TAG, "a call wasn't reported", it) }
             }
         },
         onLogChanged = {
-            notificationOps.trySend { it.callLogChanged() }
+            enqueueNotificationOp { it.callLogChanged() }
         },
     )
     private val contacts = PhoneContacts(this.context) {
-        notificationOps.trySend { it.contactsChanged() }
+        enqueueNotificationOp { it.contactsChanged() }
     }
     private val photos = RecentPhotos(
         this.context,
         onPhoto = { photo ->
-            notificationOps.trySend { node ->
+            enqueueNotificationOp { node ->
                 runCatching { node.photoTaken(photo) }.onFailure { Log.i(TAG, "a new photo wasn't announced", it) }
             }
         },
         onChanged = {
-            notificationOps.trySend { it.photosChanged() }
+            enqueueNotificationOp { it.photosChanged() }
         },
     )
 
@@ -213,12 +216,26 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
      * laser update its "off".
      */
     private val remoteOps = Channel<suspend (NectarlinkNode) -> Unit>(Channel.UNLIMITED)
+
+    private fun enqueueNotificationOp(op: suspend (NectarlinkNode) -> Unit) {
+        if (node != null) {
+            notificationOps.trySend(op)
+        }
+    }
+
+    private fun enqueueRemoteOp(op: suspend (NectarlinkNode) -> Unit) {
+        if (node != null) {
+            remoteOps.trySend(op)
+        }
+    }
+
     private val _state = MutableStateFlow(CoreState())
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     private val _queuedNotices = MutableSharedFlow<OfflineQueuedNotice>(extraBufferCapacity = 8)
     private val _clipSuggestions = MutableSharedFlow<ClipSuggestionNotice>(extraBufferCapacity = 4)
     private var node: NectarlinkNode? = null
     private var startJob: Job? = null
+    private var runJob: Job? = null
     private var networkChange: Job? = null
     private val wakeTimers = java.util.concurrent.ConcurrentHashMap<String, Job>()
 
@@ -343,6 +360,9 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
     @Synchronized
     fun start() {
         if (startJob != null) return
+        val currentRun = Job()
+        runJob = currentRun
+        val runScope = CoroutineScope(scope.coroutineContext + currentRun)
         startJob = scope.launch(Dispatchers.IO) {
             initLogging(if (BuildConfig.DEBUG) "debug,iroh=info,swarm_discovery=error" else "info,iroh=warn,swarm_discovery=error")
             val initialAwayMode = app.nectarlink.android.ui.Preferences.isAwayModeEnabled(context)
@@ -360,6 +380,10 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
             } catch (e: NectarlinkException) {
                 Log.e(TAG, "core failed to start", e)
                 _state.update { it.copy(status = CoreStatus.Failed(e.message ?: e.javaClass.simpleName)) }
+                return@launch
+            }
+            if (!currentRun.isActive) {
+                started.shutdown()
                 return@launch
             }
             node = started
@@ -397,10 +421,11 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                     localsendPeers = lsPeers,
                 )
             }
+            NotificationListener.instance?.refreshActive()
             refreshDataRetention()
             app.nectarlink.android.clipboard.DirectShareTargets.sync(context, _state.value.devices)
             app.nectarlink.android.widget.PcWidgetProvider.refreshAll(context, _state.value)
-            scope.launch(Dispatchers.IO) {
+            runScope.launch(Dispatchers.IO) {
                 _state
                     .map { s ->
                         s.devices.map { d -> listOf(d.id, d.name, d.online, d.canWake, d.wakeState) }
@@ -412,7 +437,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                         app.nectarlink.android.widget.PcWidgetProvider.refreshAll(context, s)
                     }
             }
-            scope.launch(Dispatchers.IO) {
+            runScope.launch(Dispatchers.IO) {
                 var first = true
                 _state
                     .map { s ->
@@ -451,8 +476,8 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
             }
             started.updatePower(powerLevel(), capabilities(NotificationListener.hasAccess(context)))
             // Elevated, when set up and wireless debugging is on.
-            scope.launch { Elevated.start() }
-            scope.launch(Dispatchers.Main) {
+            runScope.launch { Elevated.start() }
+            runScope.launch(Dispatchers.Main) {
                 // Allow first Compose frame to draw before registering BroadcastReceivers and ContentObservers on Main.
                 delay(48L)
                 battery.start()
@@ -476,17 +501,66 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                         }
                     }
             }
-            scope.launch {
+            runScope.launch {
                 for (op in notificationOps) {
                     runCatching { op(started) }.onFailure { Log.w(TAG, "notification update failed", it) }
                 }
             }
-            scope.launch {
+            runScope.launch {
                 for (op in remoteOps) {
                     runCatching { op(started) }.onFailure { Log.w(TAG, "remote input failed", it) }
                 }
             }
         }
+    }
+
+    /**
+     * Shuts down the active node and all per-run collectors, monitors, and loops.
+     * Sets status back to [CoreStatus.Starting] and clears node references.
+     * Safe to call repeatedly, synchronized with [start] so stop and start cannot interleave.
+     */
+    @Synchronized
+    fun stop() {
+        val activeJob = startJob
+        val activeNode = node
+        val activeRun = runJob
+        if (activeJob == null && activeNode == null && activeRun == null) return
+
+        activeRun?.cancel()
+        runJob = null
+
+        runBlocking(Dispatchers.IO) {
+            activeJob?.cancelAndJoin()
+            activeNode?.shutdown()
+            runCatching { Elevated.stop() }
+        }
+        node = null
+        startJob = null
+
+        // Stop monitors and clear active reporting state so a subsequent start re-reports everything cleanly.
+        lastReportedBattery = null
+        scope.launch(Dispatchers.Main) {
+            battery.stop()
+            accent.stop()
+            network.stop()
+            calls.stop()
+            contacts.stop()
+            sms.stop()
+            signal.stop()
+            toggles.stop()
+            photos.stop()
+            phoneMedia.stop()
+            pcSpeakerPlayer.stop()
+        }
+        localsendMulticast?.runCatching { release() }
+        wakeTimers.values.forEach { it.cancel() }
+        wakeTimers.clear()
+
+        // Drain any pending operations so they don't replay on the next run.
+        while (notificationOps.tryReceive().isSuccess) {}
+        while (remoteOps.tryReceive().isSuccess) {}
+
+        _state.update { it.copy(status = CoreStatus.Starting) }
     }
 
     // ---- Notifications (from NotificationListener) ----
@@ -499,22 +573,22 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
         _state.update { it.copy(notificationAccess = granted) }
         if (granted && _state.value.devices.isNotEmpty()) ConnectionService.start(context)
         scope.launch(Dispatchers.Main) { if (granted) phoneMedia.start() else phoneMedia.stop() }
-        notificationOps.trySend { node ->
+        enqueueNotificationOp { node ->
             node.updatePower(powerLevel(), capabilities(granted))
             node.notificationsReset(showing)
         }
     }
 
     fun notificationPosted(notification: Notification) {
-        notificationOps.trySend { it.notificationPosted(notification) }
+        enqueueNotificationOp { it.notificationPosted(notification) }
     }
 
     fun notificationRemoved(key: String) {
-        notificationOps.trySend { it.notificationRemoved(key) }
+        enqueueNotificationOp { it.notificationRemoved(key) }
     }
 
     fun notificationsRefreshed(showing: List<Notification>) {
-        notificationOps.trySend { it.notificationsReset(showing) }
+        enqueueNotificationOp { it.notificationsReset(showing) }
     }
 
     @Volatile private var lastSensitiveAccess = false
@@ -603,7 +677,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                             if (contactsAccess) contacts.start() else contacts.stop()
                             if (PhoneSms.canRead(context)) sms.start() else sms.stop()
                         }
-                        notificationOps.trySend {
+                        enqueueNotificationOp {
                             it.updatePower(powerLevel(), capabilities(_state.value.notificationAccess))
                             if (photoAccess && (!prevPhotos || photoPartialAccess)) it.photosChanged()
                         }
@@ -1945,7 +2019,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
             }
         }
         if (shouldQueue) {
-            remoteOps.trySend { node ->
+            enqueueRemoteOp { node ->
                 val (targetId, totalDx, totalDy) = synchronized(pendingMoveLock) {
                     val t = pendingMovePcId
                     val x = pendingMoveDx
@@ -1964,7 +2038,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
 
     /** Scrolls on a PC (`dy` > 0 scrolls down, `dx` > 0 scrolls right, in wheel notches). */
     fun remoteScroll(id: String, dx: Float, dy: Float, fast: Boolean = true) {
-        remoteOps.trySend { runCatching { it.remoteScroll(id, dx, dy, fast) } }
+        enqueueRemoteOp { runCatching { it.remoteScroll(id, dx, dy, fast) } }
     }
 
     /** Presses, releases or clicks a mouse button (`"left"`, `"right"` or `"middle"`). */
@@ -1989,7 +2063,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
 
     /** Moves or hides the laser pointer on a PC (`x`, `y` in `0..1`). */
     fun remoteLaser(id: String, on: Boolean, x: Float = 0.5f, y: Float = 0.5f) {
-        remoteOps.trySend { runCatching { it.remoteLaser(id, on, x, y) } }
+        enqueueRemoteOp { runCatching { it.remoteLaser(id, on, x, y) } }
     }
 
     /**
@@ -2029,16 +2103,16 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
 
     /** Requests an immediate IDR keyframe from a paired PC streaming its screen. */
     fun requestPcMirrorKeyframe(id: String) {
-        remoteOps.trySend { runCatching { it.requestPcMirrorKeyframe(id) } }
+        enqueueRemoteOp { runCatching { it.requestPcMirrorKeyframe(id) } }
     }
 
     /** Sends a normalized touch, scroll, key, or text event to a paired PC during reverse mirroring. */
     fun sendPcMirrorInput(id: String, input: app.nectarlink.core.MirrorInputEvent) {
-        remoteOps.trySend { runCatching { it.sendPcMirrorInput(id, input) } }
+        enqueueRemoteOp { runCatching { it.sendPcMirrorInput(id, input) } }
     }
 
     private fun remoteCommand(onStatus: ((RemoteAccess) -> Unit)?, block: suspend (NectarlinkNode) -> Unit) {
-        remoteOps.trySend { node ->
+        enqueueRemoteOp { node ->
             try {
                 block(node)
                 onStatus?.invoke(RemoteAccess.Allowed)
@@ -2116,7 +2190,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                 s
             }
         }
-        remoteOps.trySend { node ->
+        enqueueRemoteOp { node ->
             try {
                 node.setPcAudio(id, wireVol, muted)
             } catch (e: NectarlinkException) {
@@ -2139,7 +2213,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
             startJob?.join()
             val currentNode = node ?: return@launch
             runCatching { currentNode.setDeviceToggle(pcId, PhoneStorage.TOGGLE_NAME, enabled) }
-            notificationOps.trySend {
+            enqueueNotificationOp {
                 it.updatePower(powerLevel(), capabilities(_state.value.notificationAccess))
             }
         }
