@@ -65,7 +65,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -244,6 +245,8 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
     @Volatile private var runJob: Job? = null
     @Volatile private var runScope: CoroutineScope? = null
     @Volatile private var networkChange: Job? = null
+    private val lifecycleMutex = Mutex()
+    private val lifecycleGeneration = java.util.concurrent.atomic.AtomicLong(0L)
     private val wakeTimers = java.util.concurrent.ConcurrentHashMap<String, Job>()
 
     @Volatile private var lastBattery: app.nectarlink.core.Battery? = null
@@ -364,14 +367,17 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
      * app calls it twice as it opens, and two calls at once used to start
      * two nodes with one identity, which kept taking the PC from each other.
      */
-    @Synchronized
     fun start() {
-        if (startJob != null) return
-        val currentRun = Job()
-        runJob = currentRun
-        val currentRunScope = CoroutineScope(scope.coroutineContext + currentRun)
-        runScope = currentRunScope
-        startJob = scope.launch(Dispatchers.IO) {
+        val gen = lifecycleGeneration.incrementAndGet()
+        scope.launch(Dispatchers.IO) {
+            lifecycleMutex.withLock {
+                if (lifecycleGeneration.get() != gen) return@withLock
+                if (node != null || startJob?.isActive == true) return@withLock
+                val currentRun = Job()
+                runJob = currentRun
+                val currentRunScope = CoroutineScope(scope.coroutineContext + currentRun)
+                runScope = currentRunScope
+                val job = currentRunScope.launch(Dispatchers.IO) {
             initLogging(if (BuildConfig.DEBUG) "debug,iroh=info,swarm_discovery=error" else "info,iroh=warn,swarm_discovery=error")
             val initialAwayMode = app.nectarlink.android.ui.Preferences.isAwayModeEnabled(context)
             val options = NodeOptions(
@@ -390,7 +396,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                 _state.update { it.copy(status = CoreStatus.Failed(e.message ?: e.javaClass.simpleName)) }
                 return@launch
             }
-            if (!currentRun.isActive) {
+            if (!currentRun.isActive || lifecycleGeneration.get() != gen) {
                 started.shutdown()
                 return@launch
             }
@@ -436,7 +442,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
             refreshDataRetention()
             app.nectarlink.android.clipboard.DirectShareTargets.sync(context, _state.value.devices)
             app.nectarlink.android.widget.PcWidgetProvider.refreshAll(context, _state.value)
-            runScope.launch(Dispatchers.IO) {
+            currentRunScope.launch(Dispatchers.IO) {
                 _state
                     .map { s ->
                         s.devices.map { d -> listOf(d.id, d.name, d.online, d.canWake, d.wakeState) }
@@ -448,7 +454,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                         app.nectarlink.android.widget.PcWidgetProvider.refreshAll(context, s)
                     }
             }
-            runScope.launch(Dispatchers.IO) {
+            currentRunScope.launch(Dispatchers.IO) {
                 var first = true
                 _state
                     .map { s ->
@@ -487,8 +493,8 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
             }
             started.updatePower(powerLevel(), capabilities(NotificationListener.hasAccess(context)))
             // Elevated, when set up and wireless debugging is on.
-            runScope.launch { Elevated.start() }
-            runScope.launch(Dispatchers.Main) {
+            currentRunScope.launch { Elevated.start() }
+            currentRunScope.launch(Dispatchers.Main) {
                 // Allow first Compose frame to draw before registering BroadcastReceivers and ContentObservers on Main.
                 delay(48L)
                 battery.start()
@@ -513,67 +519,77 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                         }
                     }
             }
-            runScope.launch {
+            currentRunScope.launch {
                 for (op in notificationOps) {
                     runCatching { op(started) }.onFailure { Log.w(TAG, "notification update failed", it) }
                 }
             }
-            runScope.launch {
+            currentRunScope.launch {
                 for (op in remoteOps) {
                     runCatching { op(started) }.onFailure { Log.w(TAG, "remote input failed", it) }
                 }
             }
         }
+        startJob = job
     }
+}
+}
 
     /**
      * Shuts down the active node and all per-run collectors, monitors, and loops.
      * Sets status back to [CoreStatus.Starting] and clears node references.
-     * Safe to call repeatedly, synchronized with [start] so stop and start cannot interleave.
+     * Non-blocking and safe to call from any thread.
      */
-    @Synchronized
     fun stop() {
-        val activeJob = startJob
-        val activeNode = node
-        val activeRun = runJob
-        if (activeJob == null && activeNode == null && activeRun == null) return
+        val gen = lifecycleGeneration.incrementAndGet()
+        scope.launch(Dispatchers.IO) {
+            lifecycleMutex.withLock {
+                if (lifecycleGeneration.get() != gen) return@withLock
+                val activeJob = startJob
+                val activeRun = runJob
+                if (activeJob == null && node == null && activeRun == null) return@withLock
 
-        activeRun?.cancel()
-        runJob = null
+                activeRun?.cancelAndJoin()
+                activeJob?.cancelAndJoin()
 
-        runBlocking(Dispatchers.IO) {
-            activeJob?.cancelAndJoin()
-            activeNode?.shutdown()
-            runCatching { Elevated.stop() }
+                val activeNode = node
+                synchronized(opsLock) {
+                    isRunning = false
+                    node = null
+                    // Drain any pending operations so they don't replay on the next run.
+                    while (notificationOps.tryReceive().isSuccess) {}
+                    while (remoteOps.tryReceive().isSuccess) {}
+                }
+                startJob = null
+                runJob = null
+                runScope = null
+
+                activeNode?.shutdown()
+                runCatching { Elevated.stop() }
+
+                withContext(Dispatchers.Main) {
+                    battery.stop()
+                    accent.stop()
+                    network.stop()
+                    calls.stop()
+                    contacts.stop()
+                    sms.stop()
+                    signal.stop()
+                    toggles.stop()
+                    photos.stop()
+                    phoneMedia.stop()
+                    pcSpeakerPlayer.stop()
+                }
+
+                lastReportedBattery = null
+                localsendMulticast?.runCatching { release() }
+                wakeTimers.values.forEach { it.cancel() }
+                wakeTimers.clear()
+
+                _state.update { it.withDevicesOffline().copy(status = CoreStatus.Starting) }
+                app.nectarlink.android.widget.PcWidgetProvider.refreshAll(context, _state.value)
+            }
         }
-        startJob = null
-        lastReportedBattery = null
-        scope.launch(Dispatchers.Main) {
-            battery.stop()
-            accent.stop()
-            network.stop()
-            calls.stop()
-            contacts.stop()
-            sms.stop()
-            signal.stop()
-            toggles.stop()
-            photos.stop()
-            phoneMedia.stop()
-            pcSpeakerPlayer.stop()
-        }
-        localsendMulticast?.runCatching { release() }
-        wakeTimers.values.forEach { it.cancel() }
-        wakeTimers.clear()
-
-        synchronized(opsLock) {
-            isRunning = false
-            node = null
-            // Drain any pending operations so they don't replay on the next run.
-            while (notificationOps.tryReceive().isSuccess) {}
-            while (remoteOps.tryReceive().isSuccess) {}
-        }
-
-        _state.update { it.withDevicesOffline().copy(status = CoreStatus.Starting) }
     }
 
     // ---- Notifications (from NotificationListener) ----

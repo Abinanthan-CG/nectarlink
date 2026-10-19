@@ -77,7 +77,10 @@ class NectarlinkApplication : Application(), DefaultLifecycleObserver {
         pendingStopJob?.cancel()
         pendingStopJob = scope.launch(Dispatchers.IO) {
             delay(STOP_DELAY_MS)
-            core.stop()
+            val inForeground = ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+            if (!inForeground && !Preferences.isBackgroundServiceEnabled(this@NectarlinkApplication)) {
+                core.stop()
+            }
         }
     }
 
