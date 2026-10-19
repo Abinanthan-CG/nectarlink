@@ -216,15 +216,22 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
      */
     private val remoteOps = Channel<suspend (NectarlinkNode) -> Unit>(Channel.UNLIMITED)
 
+    private val opsLock = Any()
+    @Volatile private var isRunning = false
+
     private fun enqueueNotificationOp(op: suspend (NectarlinkNode) -> Unit) {
-        if (node != null) {
-            notificationOps.trySend(op)
+        synchronized(opsLock) {
+            if (isRunning && node != null) {
+                notificationOps.trySend(op)
+            }
         }
     }
 
     private fun enqueueRemoteOp(op: suspend (NectarlinkNode) -> Unit) {
-        if (node != null) {
-            remoteOps.trySend(op)
+        synchronized(opsLock) {
+            if (isRunning && node != null) {
+                remoteOps.trySend(op)
+            }
         }
     }
 
@@ -232,10 +239,11 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     private val _queuedNotices = MutableSharedFlow<OfflineQueuedNotice>(extraBufferCapacity = 8)
     private val _clipSuggestions = MutableSharedFlow<ClipSuggestionNotice>(extraBufferCapacity = 4)
-    private var node: NectarlinkNode? = null
-    private var startJob: Job? = null
-    private var runJob: Job? = null
-    private var networkChange: Job? = null
+    @Volatile private var node: NectarlinkNode? = null
+    @Volatile private var startJob: Job? = null
+    @Volatile private var runJob: Job? = null
+    @Volatile private var runScope: CoroutineScope? = null
+    @Volatile private var networkChange: Job? = null
     private val wakeTimers = java.util.concurrent.ConcurrentHashMap<String, Job>()
 
     @Volatile private var lastBattery: app.nectarlink.core.Battery? = null
@@ -385,7 +393,10 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                 started.shutdown()
                 return@launch
             }
-            node = started
+            synchronized(opsLock) {
+                node = started
+                isRunning = true
+            }
             val devices = runCatching { started.pairedDevices() }.getOrDefault(emptyList())
             val pcToggles = perPcToggles(started, devices.map { it.id })
             val clipHistEnabled = runCatching { started.clipboardHistoryEnabled() }.getOrDefault(true)
@@ -533,10 +544,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
             activeNode?.shutdown()
             runCatching { Elevated.stop() }
         }
-        node = null
         startJob = null
-
-        // Stop monitors and clear active reporting state so a subsequent start re-reports everything cleanly.
         lastReportedBattery = null
         scope.launch(Dispatchers.Main) {
             battery.stop()
@@ -555,9 +563,13 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
         wakeTimers.values.forEach { it.cancel() }
         wakeTimers.clear()
 
-        // Drain any pending operations so they don't replay on the next run.
-        while (notificationOps.tryReceive().isSuccess) {}
-        while (remoteOps.tryReceive().isSuccess) {}
+        synchronized(opsLock) {
+            isRunning = false
+            node = null
+            // Drain any pending operations so they don't replay on the next run.
+            while (notificationOps.tryReceive().isSuccess) {}
+            while (remoteOps.tryReceive().isSuccess) {}
+        }
 
         _state.update { it.withDevicesOffline().copy(status = CoreStatus.Starting) }
     }
