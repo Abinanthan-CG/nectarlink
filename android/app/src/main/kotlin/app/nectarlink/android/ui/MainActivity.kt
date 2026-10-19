@@ -909,6 +909,12 @@ private fun App(
                                         preferences.update { it.copy(theme = "hive") }
                                     },
                                     onDismissHiveInvite = preferences::answerHiveInvite,
+                                    backgroundServiceEnabled = backgroundServiceEnabled,
+                                    onTurnOnBackgroundService = {
+                                        preferences.updateBackgroundServiceEnabled(true)
+                                        core.start()
+                                        ConnectionService.start(context)
+                                    },
                                     onDismissWhatsNewGuide = {
                                         preferences.updateWalkthrough { it.dismissWhatsNewGuide() }
                                     },
