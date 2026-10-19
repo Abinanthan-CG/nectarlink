@@ -559,7 +559,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
         while (notificationOps.tryReceive().isSuccess) {}
         while (remoteOps.tryReceive().isSuccess) {}
 
-        _state.update { it.copy(status = CoreStatus.Starting) }
+        _state.update { it.withDevicesOffline().copy(status = CoreStatus.Starting) }
     }
 
     // ---- Notifications (from NotificationListener) ----
