@@ -948,6 +948,7 @@ private fun App(
                                     onToggleBackgroundService = { enabled ->
                                         preferences.updateBackgroundServiceEnabled(enabled)
                                         if (enabled) {
+                                            core.start()
                                             ConnectionService.start(context)
                                         } else {
                                             ConnectionService.stop(context)

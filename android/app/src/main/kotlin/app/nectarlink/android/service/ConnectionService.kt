@@ -111,6 +111,7 @@ class ConnectionService : LifecycleService() {
             Preferences.setBackgroundServiceEnabled(this, false)
             stopSelf()
             getSystemService(NotificationManager::class.java)?.cancel(ONGOING_ID)
+            (application as? NectarlinkApplication)?.onBackgroundServiceDisabled()
             return START_NOT_STICKY
         }
         if (intent?.action == ACTION_STOP_RINGING) {
