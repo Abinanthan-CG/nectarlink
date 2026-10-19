@@ -216,11 +216,9 @@ class ConnectionService : LifecycleService() {
         private const val ACTION_STOP_RINGING = "app.nectarlink.action.STOP_RINGING"
         internal const val ACTION_STOP_SERVICE = "app.nectarlink.action.STOP_SERVICE"
 
-        internal fun shouldStart(backgroundEnabled: Boolean): Boolean = backgroundEnabled
-
         /** Starts the service when allowed by Android's foreground-service rules. */
         fun start(context: Context) {
-            if (!shouldStart(Preferences.isBackgroundServiceEnabled(context))) return
+            if (!Preferences.isBackgroundServiceEnabled(context)) return
             runCatching {
                 ContextCompat.startForegroundService(context, Intent(context, ConnectionService::class.java))
             }.onFailure {
