@@ -85,8 +85,8 @@ class CompanionAndMigrationTest {
     }
 
     @Test
-    fun `ConnectionService stop action and Preferences background service key`() {
-        assertEquals("app.nectarlink.action.STOP_SERVICE", ConnectionService.ACTION_STOP_SERVICE)
-        assertEquals("background_service_enabled", Preferences.BACKGROUND_SERVICE_ENABLED)
+    fun `ConnectionService does not start when background service is disabled`() {
+        assertFalse(ConnectionService.shouldStart(backgroundEnabled = false))
+        assertTrue(ConnectionService.shouldStart(backgroundEnabled = true))
     }
 }
