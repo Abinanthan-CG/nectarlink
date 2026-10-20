@@ -35,9 +35,12 @@ import app.nectarlink.android.recorder.SavedRecording
 import app.nectarlink.android.service.ConnectionService
 import app.nectarlink.android.sms.PhoneSms
 import app.nectarlink.android.storage.PhoneStorage
+import app.nectarlink.android.mic.MicService
+import app.nectarlink.android.mirror.MirrorService
 import app.nectarlink.android.toggles.PhoneToggles
 import app.nectarlink.android.webcam.WebcamRequests
 import app.nectarlink.android.webcam.WebcamService
+import app.nectarlink.core.FfiQueueStatus
 import app.nectarlink.core.Event
 import app.nectarlink.core.EventListener
 import app.nectarlink.core.FileToSend
@@ -70,11 +73,14 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -312,6 +318,19 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
     }
 
     val state: StateFlow<CoreState> = _state.asStateFlow()
+
+    /** True while a user-facing stream or transfer is active. */
+    val busy: StateFlow<Boolean> = combine(
+        _state.map { s ->
+            s.transfers.any { !it.isFinished() } ||
+                s.sendQueue.any { it.status is FfiQueueStatus.Sending || it.status is FfiQueueStatus.Waiting }
+        }.distinctUntilChanged(),
+        MirrorService.session.map { it.active }.distinctUntilChanged(),
+        WebcamService.session.map { it.active || it.connecting }.distinctUntilChanged(),
+        MicService.streaming.map { it != null }.distinctUntilChanged(),
+    ) { hasTransfers: Boolean, isMirroring: Boolean, isWebcam: Boolean, isMic: Boolean ->
+        hasTransfers || isMirroring || isWebcam || isMic
+    }.stateIn(scope, SharingStarted.Eagerly, false)
 
     /** Short messages for the user (a command failed). */
     val messages: SharedFlow<String> = _messages.asSharedFlow()

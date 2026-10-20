@@ -2,6 +2,8 @@
 package app.nectarlink.android
 
 import android.app.Application
+import android.content.Context
+import android.content.SharedPreferences
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -16,6 +18,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 /** Starts the core with the process and keeps it for the app's lifetime. */
@@ -28,6 +31,20 @@ class NectarlinkApplication : Application(), DefaultLifecycleObserver {
     val updater: AppUpdater by lazy { AppUpdater(this) }
 
     private var pendingStopJob: Job? = null
+
+    private val prefListener =
+        SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == Preferences.BACKGROUND_SERVICE_ENABLED) {
+                if (Preferences.isBackgroundServiceEnabled(this)) {
+                    pendingStopJob?.cancel()
+                    pendingStopJob = null
+                } else {
+                    if (!isInForeground()) {
+                        scheduleStop()
+                    }
+                }
+            }
+        }
 
     override fun onCreate() {
         super<Application>.onCreate()
@@ -42,6 +59,8 @@ class NectarlinkApplication : Application(), DefaultLifecycleObserver {
         Elevated.onClipboardChanged = { text, html -> core.onElevatedClipboardChanged(text, html) }
 
         ProcessLifecycleOwner.get().lifecycle.addObserver(this)
+        getSharedPreferences("appearance", Context.MODE_PRIVATE)
+            .registerOnSharedPreferenceChangeListener(prefListener)
 
         if (Preferences.isBackgroundServiceEnabled(this)) {
             android.view.Choreographer.getInstance().postFrameCallback {
@@ -67,18 +86,30 @@ class NectarlinkApplication : Application(), DefaultLifecycleObserver {
     }
 
     fun onBackgroundServiceDisabled() {
-        val inForeground = ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-        if (!inForeground) {
+        if (!isInForeground()) {
             scheduleStop()
         }
     }
+
+    private fun isInForeground(): Boolean =
+        ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+
+    private fun isStopEligible(): Boolean =
+        !isInForeground() && !Preferences.isBackgroundServiceEnabled(this)
 
     private fun scheduleStop() {
         pendingStopJob?.cancel()
         pendingStopJob = scope.launch(Dispatchers.IO) {
             delay(STOP_DELAY_MS)
-            val inForeground = ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-            if (!inForeground && !Preferences.isBackgroundServiceEnabled(this@NectarlinkApplication)) {
+            if (!isStopEligible()) return@launch
+
+            while (core.busy.value) {
+                core.busy.first { !it }
+                delay(STOP_IDLE_DEBOUNCE_MS)
+                if (!isStopEligible()) return@launch
+            }
+
+            if (isStopEligible()) {
                 core.stop()
             }
         }
@@ -86,5 +117,6 @@ class NectarlinkApplication : Application(), DefaultLifecycleObserver {
 
     companion object {
         const val STOP_DELAY_MS = 5_000L
+        const val STOP_IDLE_DEBOUNCE_MS = 2_000L
     }
 }
