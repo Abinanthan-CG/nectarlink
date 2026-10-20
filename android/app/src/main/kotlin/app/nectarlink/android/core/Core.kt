@@ -246,7 +246,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
     @Volatile private var runScope: CoroutineScope? = null
     @Volatile private var networkChange: Job? = null
     private val lifecycleMutex = Mutex()
-    private val lifecycleGeneration = java.util.concurrent.atomic.AtomicLong(0L)
+    private val startGuard = StartGuard()
     private val wakeTimers = java.util.concurrent.ConcurrentHashMap<String, Job>()
 
     @Volatile private var lastBattery: app.nectarlink.core.Battery? = null
@@ -368,11 +368,10 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
      * two nodes with one identity, which kept taking the PC from each other.
      */
     fun start() {
-        val gen = lifecycleGeneration.incrementAndGet()
         scope.launch(Dispatchers.IO) {
             lifecycleMutex.withLock {
-                if (lifecycleGeneration.get() != gen) return@withLock
                 if (node != null || startJob?.isActive == true) return@withLock
+                val token = startGuard.beginStart()
                 val currentRun = Job()
                 runJob = currentRun
                 val currentRunScope = CoroutineScope(scope.coroutineContext + currentRun)
@@ -396,8 +395,8 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                 _state.update { it.copy(status = CoreStatus.Failed(e.message ?: e.javaClass.simpleName)) }
                 return@launch
             }
-            if (!currentRun.isActive || lifecycleGeneration.get() != gen) {
-                started.shutdown()
+            if (!currentRun.isActive || startGuard.isCancelled(token)) {
+                shutdownAndCloseNode(started)
                 return@launch
             }
             synchronized(opsLock) {
@@ -541,10 +540,9 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
      * Non-blocking and safe to call from any thread.
      */
     fun stop() {
-        val gen = lifecycleGeneration.incrementAndGet()
+        startGuard.stop()
         scope.launch(Dispatchers.IO) {
             lifecycleMutex.withLock {
-                if (lifecycleGeneration.get() != gen) return@withLock
                 val activeJob = startJob
                 val activeRun = runJob
                 if (activeJob == null && node == null && activeRun == null) return@withLock
@@ -564,7 +562,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                 runJob = null
                 runScope = null
 
-                activeNode?.shutdown()
+                activeNode?.let { shutdownAndCloseNode(it) }
                 runCatching { Elevated.stop() }
 
                 withContext(Dispatchers.Main) {
@@ -589,6 +587,14 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                 _state.update { it.withDevicesOffline().copy(status = CoreStatus.Starting) }
                 app.nectarlink.android.widget.PcWidgetProvider.refreshAll(context, _state.value)
             }
+        }
+    }
+
+    private suspend fun shutdownAndCloseNode(node: NectarlinkNode) {
+        try {
+            node.shutdown()
+        } finally {
+            runCatching { node.close() }
         }
     }
 
